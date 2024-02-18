@@ -1,0 +1,342 @@
+---
+title: "SARS-Cov2-ORF-screen"
+author: "F. Heigwer"
+date: "6/9/2020"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+## Abstract
+
+In this screen we are analyzing a sgRNA/CRISPR knockout screen performed by the group of Ralf Bartenschlager and the Group of Michael Boutros.
+
+There are cells transduced using the HDCRISPR library A (Henkel et al., 2020), selected for viral integration (using blasticidin resistance) and then infected  with the new SARS-Cov2 virus.
+
+The aim of this script is to find sgRNAs/genes whose knockout renders cells resistant or susceptible to SARS-Cov2 infection.
+
+Cells used were A549-ACE2 human lung epithelial adenocarcinoma cells harboring and ACE2 over-expression.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(ggpubr)
+library(patchwork)
+library(ggrepel)
+library(fgsea)
+library(preprocessCore)
+
+```
+
+## B110 Theme
+
+```{r theme, include=FALSE}
+theme_b110<-function(){
+  theme_classic() +
+  theme(
+    axis.text=element_text(size = 16), 
+    axis.title=element_text(size = 16),
+    plot.title = element_text(size = 22,hjust = 0.5,face="bold"),
+    legend.title = element_text(size = 22),
+    legend.text = element_text(size =16),
+    legend.position = "bottom"
+    )
+}
+```
+
+## B110 Colors
+
+```{r colors}
+sgi_blue    = '#5087C8'
+sgi_yellow1 = '#F2EE35'
+sgi_yellow2 = '#FED98E'
+b110_grey   = '#808080'
+b110_grey_light   = '#909090'
+b110_transparent_black = alpha('#000000',0.5)
+google_red = '#dd4b39'
+google_green = '#0F9D58'
+google_yellow = '#F4B400'
+google_blue = '#4285F4'
+
+```
+
+## Annotation read in
+
+First we need the screening library. This was provided as an excel sheet by Luisa Henkel.
+
+```{r library_annotation}
+
+annotations <- read_delim("../annotations/mageck_library_A.csv",delim = ",") %>% dplyr::rename(Geneid=Gene,nopam=Seq)
+
+id2symbol <- read_delim("../annotations/id2symbol.txt",delim = "\t")
+
+annotations <- annotations %>% left_join(id2symbol)
+
+```
+
+Second we need the sample annotations for this sequencing run.
+
+```{r seq_anno}
+
+samples <- read_delim("../annotations/sequencing_meta.tsv",delim = "\t")
+
+sample_annotation <- 
+  samples %>% 
+  select(file_name=FASTQ_FILE,type=SAMPLE_ID) %>%
+  filter(!grepl("Undeterm",file_name)) %>%
+  separate(type,c("cell_id","treatment","replicate")) %>%
+  mutate(treatment = if_else(treatment %in% c("COV"),"COV2",treatment)) %>%
+  mutate(treatment = if_else(treatment %in% c("COV2"),treatment,"T0")) %>%
+  mutate(replicate = if_else(replicate %in% c("Rep1","Rep2","Rep3"),replicate,"Lib")) %>% mutate(sample_id = gsub(pattern = "(.+)\\.fastq\\.gz",replacement = "\\1",x = file_name) )
+
+```
+
+## raw data read-in
+
+First we read in the raw FASTQ files from gunziped files. 
+
+We sequenced exactly 20 nt of the spacer within the guideRNA. This is the sequence specific to the target gene and by that means it is also uniquely identifying the target gene and according sgRNA.
+
+We use mageck for sgRNA quantification and continue with the raw count table as the input for hit-calling analyis:
+
+Genome Biol. 2014;15(12):554., doi: 10.1186/s13059-014-0554-4.
+MAGeCK enables robust identification of essential genes from genome-scale CRISPR/Cas9 knockout screens
+Wei Li, Han Xu, Tengfei Xiao, Le Cong, Michael I Love, Feng Zhang, Rafael A Irizarry, Jun S Liu, Myles Brown, X Shirley Liu
+
+The command for counting with mageck version 0.5.9.2 .
+
+```{r}
+
+mageck_counts <- read_delim("../raw_counts/raw_counts_mageck.txt",delim = "\t") %>% dplyr::rename("Geneid"="Gene")
+
+annotated_sample <- annotated_sample_raw <- mageck_counts %>% 
+  gather(sample_id,value,-sgRNA,-Geneid) %>% 
+  left_join(annotations) %>% 
+  left_join(sample_annotation) %>%
+  unite(sample_name,cell_id,treatment,replicate,remove = F) %>%
+  mutate(sample_name=factor(sample_name,levels=c("A549_T0_Lib","A549_COV2_Rep1","A549_COV2_Rep2","A549_COV2_Rep3")))
+
+```
+
+## Quality control
+
+Let's produce some overview statistics that analyze how many sgRNAs were found and how many genes were covered.
+
+```{r}
+
+# get the number of mapped reads per same
+p1 <- annotated_sample_raw %>%
+  group_by(sample_name) %>%
+  summarise(reads_mapped = sum(value)) %>%
+  ggplot(aes(x = sample_name,y=reads_mapped)) +
+    geom_bar(stat = "identity") +
+    theme_b110() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    ggtitle("reads/sample mapped")+
+    xlab("sample")+
+    ylab("reads mapped")
+  
+# get the number of mapped orf barcodes per sample
+p2 <- annotated_sample_raw %>%
+  group_by(sample_name) %>%
+  summarise(barcodes_mapped = sum(value!=0)) %>%
+  ggplot(aes(x = sample_name,y=barcodes_mapped)) +
+    geom_bar(stat = "identity") +
+    theme_b110() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    ggtitle("sgRNA/sample mapped") +
+    xlab("sample")+
+    ylab("sgRNAs mapped")
+
+p3 <- p1 + p2
+
+ggsave("../plots/read_depth_overview.pdf",p3,width = 10,height = 6)
+
+```
+
+# Differential gene presence
+
+To analyse which genes confer resistance to SARS-CoV2 infection we first extract the reaw counts for all samples. Then we calculate the median read count of all sgRNAs that target any region in the genome. To avoid zero-division, we add a constant 1 to each samples median.Each sample's read counts are then divided by this target control meian and multiplied by the overall sample median that includes all sgRNAs. The resulting read count distribution is plotted.
+
+```{r differential_genes}
+p1 <- annotated_sample %>%  ggplot(aes(log(value))) +
+  geom_density(aes(colour = sample_name)) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme_classic() +
+  ggtitle("raw log counts") + 
+  theme(legend.position = "none")
+  
+
+nontarg <- c('NONTARG', 'LacZ', 'EGFP', 'luciferase')
+
+ctrls <- annotated_sample %>% distinct(sgRNA, Geneid) %>%
+  filter(grepl('CONTROL', sgRNA)) %>%
+  mutate(ctrl_type = ifelse(Geneid %in% nontarg, 'nontarg', 'targ'))
+
+## median of targeting controls per library
+targ_med <- annotated_sample %>%
+  filter(sgRNA %in% (filter(ctrls, ctrl_type == 'targ') %>% pull(sgRNA))) %>%
+  group_by(sample_name) %>%
+  summarise(med_count = median(value + 1)) %>% ungroup()
+
+annotated_sample <- annotated_sample %>% inner_join(targ_med) %>%
+  mutate(value = ((value + 1)/med_count)*median(value+1))
+
+p2 <- annotated_sample_n %>% 
+  ggplot(aes(log(value))) +
+    geom_density(aes(colour = sample_name)) +
+    scale_y_continuous(expand = c(0, 0)) + 
+    theme_classic() +
+    ggtitle("normalized counts")
+
+p3 <- p1 + p2 + plot_layout(nrow=1,ncol=2)
+
+ggsave(filename = "../plots/A549_count_distribution.pdf",plot = p3,width = 10,height = 4)
+```
+
+# A549 fold change analysis
+
+First we extract the T0 library normalized read counts. Second, we call fold changes by subtracting the log-normalized read count of the library from the log-normalized sample read count. We then call the fold change significant by a wilcoxon rank sum test between the average fold change of sgRNA between any gene and the non-targeting controls. Replicates were collapsed by arithmetic mean for each gene and each sgRNA. P-values were then corrected for multiple testing by Benjamaini Hochberg correction.
+
+```{r}
+
+plasmid_counts <- annotated_sample %>%
+  filter(sample_name == 'A549_T0_Lib') %>%
+  distinct(sgRNA, value) %>%
+  dplyr::select(plasmid_count = value, everything())
+
+## calculate log-fold-changes based on plasmid library including T0
+fold_changes <- annotated_sample %>% filter(treatment == "COV2",cell_id=="A549") %>% inner_join(plasmid_counts) %>%
+  mutate(log2fc = log2(value) - log2(plasmid_count)) %>%
+  ungroup()
+
+p <- fold_changes %>%
+  group_by(gene_name,sample_name) %>%
+  summarise(log2fc=mean(log2fc,na.rm=T)) %>%
+  spread(sample_name,log2fc) %>%
+  ungroup() %>%
+  select(-gene_name) %>%
+  GGally::ggpairs() + 
+  theme_classic()
+
+ggsave("../plots/A549_Replicate_fc_correlation_new.pdf",p,width = 8,height = 8)
+
+ctrl_fc <- fold_changes %>%
+  filter(Geneid=="NONTARG") %>%
+  filter(cell_id=="A549",treatment!="T0") %>%
+  group_by(Geneid,gene_name,sgRNA,cell_id,treatment) %>%
+  mutate(log2fc = mean(log2fc,na.rm=T)) %>%
+  pull(log2fc)
+
+statistics <- fold_changes %>%
+  group_by(Geneid,gene_name,sgRNA,cell_id,treatment) %>%
+  mutate(log2fc = mean(log2fc,na.rm=T)) %>%
+  filter(Geneid!="NONTARG") %>%
+  filter(cell_id=="A549",treatment!="T0") %>%
+  group_by(Geneid,gene_name) %>%
+  do(wilcox.test(.$log2fc,ctrl_fc) %>% broom::tidy()) %>%
+  ungroup()
+
+statistics_annotated <- A549_result <- fold_changes %>%
+  group_by(Geneid,gene_name) %>%
+  summarise(log2fc=mean(log2fc,na.rm=T)) %>%
+  ungroup() %>%
+  left_join(statistics %>% ungroup %>% select(p.value,Geneid) %>% mutate(fdr=p.adjust(p.value,method="BH")))  %>%
+  mutate(significant = if_else(fdr<0.05,"significant","non-significant"))
+  
+# we create a non-adjusted p-value histogram. The higher the bar on the outer left the more significant results we have
+a <- statistics_annotated %>%
+  ggplot(aes(p.value)) +
+    geom_histogram() +
+    theme_b110()
+
+#next we assess the adjusted p-value histogram. The higher the bar to the left that is left after correction the better
+b <- statistics_annotated %>%
+  ggplot(aes(fdr)) +
+    geom_histogram()+
+    theme_b110()
+
+# Last we vizualize result using a so called volcano plot where we plot the log2 fold change versus the -log10 pvalue
+# we color it by FDR (adjusted pvalue) 
+c <- statistics_annotated %>%
+    ggplot(aes(x = log2fc, y = -log10(p.value))) + 
+       # geom_point(data = 
+        #            subset(statistics_annotated,significant !="significant"),
+         #          color=b110_grey_light) +
+      geom_point(
+                   color=b110_grey_light) +
+      geom_label_repel(data = 
+                        statistics_annotated %>% 
+                        filter(gene_name %in% c("ACE2","RAB9A","RAB2A","RAB7A","CTSL","MMP20","DYRK1A")),
+                       aes(label=gene_name),min.segment.length = 0) +
+    #xlim(c(0,11))+
+    theme_b110()
+
+p <- a + b 
+
+ggsave("../plots/A549_Stats_overview.pdf",p,width = 12)
+
+ggsave("../plots/A549_volcano_differentials_new.pdf",c,width = 12)
+
+A549_result %>%
+  arrange(fdr) %>% 
+  write_delim("../results/A549_results_new_full_crispr_deep.txt",delim = "\t")
+
+```
+
+# Screen integration
+
+In order to gain further insight into our data we integrated them qualitatively with data from the following comparable publications:
+
+Wei J, Alfajaro MM, DeWeirdt PC, Hanna RE, Lu-Culligan WJ, Cai WL, Strine MS, Zhang SM,
+Graziano VR, Schmitz CO, Chen JS, Mankowski MC, Filler RB, Ravindra NG, Gasque V,
+de Miguel FJ, Patil A, Chen H, Oguntuyo KY, Abriola L, Surovtseva YV, Orchard RC, Lee B,
+Lindenbach BD, Politi K, van Dijk D, Kadoch C, Simon MD, Yan Q, Doench JG, Wilen CB.
+Genome-wide CRISPR Screens Reveal Host Factors Critical for SARS-CoV-2 Infection.
+Cell. 2021 Jan 7;184(1):76-91.e13. doi: 10.1016/j.cell.2020.10.028. Epub 2020 Oct 20.
+PMID: 33147444; PMCID: PMC7574718.
+
+Wang R, Simoneau CR, Kulsuptrakul J, et al. Genetic Screens Identify Host Factors for
+SARS-CoV-2 and Common Cold Coronaviruses. Cell. 2021;184(1):106-119.e14.
+doi:10.1016/j.cell.2020.12.004
+
+Schneider WM, Luna JM, Hoffmann HH, Sánchez-Rivera FJ, Leal AA, Ashbrook AW, Le Pen J,
+Ricardo-Lax I, Michailidis E, Peace A, Stenzel AF, Lowe SW, MacDonald MR, Rice CM, Poirier JT.
+Genome-Scale Identification of SARS-CoV-2 and Pan-coronavirus Host Factor Networks.
+Cell. 2021 Jan 7;184(1):120-132.e14. doi: 10.1016/j.cell.2020.12.006. Epub 2020 Dec 9.
+PMID: 33382968; PMCID: PMC7796900.
+
+Daniloski Z, Jordan TX, Wessels HH, Hoagland DA, Kasela S, Legut M, Maniatis S,
+Mimitou EP, Lu L, Geller E, Danziger O, Rosenberg BR, Phatnani H, Smibert P,
+Lappalainen T, tenOever BR, Sanjana NE. Identification of Required Host Factors for
+SARS-CoV-2 Infection in Human Cells. Cell. 2021 Jan 7;184(1):92-105.e16.
+doi: 10.1016/j.cell.2020.10.030. Epub 2020 Oct 24. PMID: 33147445; PMCID: PMC7584921.
+
+```{r}
+
+integration_result <- read_delim("../annotations/z_score_table.txt",delim = "\t") %>%
+                        gather(screen,value,-Rank,-Gene)
+
+p <- integration_result %>%
+  ggplot(aes(x=screen,y=reorder(Gene,-Rank,median),fill=value)) +
+    geom_tile() +
+    theme_classic() +
+    theme(axis.text.x=element_text(angle = -45, hjust=0)) +
+    xlab("study") +
+    ylab("gene") +
+    scale_fill_gradient(low = "white",high = "blue") 
+
+ggsave("../plots/Study_comparison.pdf", p, width = 6,height = 7)
+
+
+```
+
+# Session info
+
+```{r}
+writeLines(capture.output(sessionInfo()), "../results/SessionInfo.txt")
+```
+
+# Bibliography
+
+
