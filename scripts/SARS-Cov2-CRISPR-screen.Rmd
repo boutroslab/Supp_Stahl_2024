@@ -114,7 +114,10 @@ annotated_sample <- annotated_sample_raw <- mageck_counts %>%
   left_join(annotations) %>% 
   left_join(sample_annotation) %>%
   unite(sample_name,cell_id,treatment,replicate,remove = F) %>%
-  mutate(sample_name=factor(sample_name,levels=c("A549_T0_Lib","A549_COV2_Rep1","A549_COV2_Rep2","A549_COV2_Rep3")))
+  mutate(sample_name=
+           factor(sample_name,
+                  levels=c("A549_T0_Lib","A549_COV2_Rep1","A549_COV2_Rep2","A549_COV2_Rep3",
+                           "Calu3_T0_Lib","Calu3_COV2_Rep1","Calu3_COV2_Rep2","Calu3_COV2_Rep3")))
 
 ```
 
@@ -159,7 +162,9 @@ ggsave("../plots/read_depth_overview.pdf",p3,width = 10,height = 6)
 To analyse which genes confer resistance to SARS-CoV2 infection we first extract the reaw counts for all samples. Then we calculate the median read count of all sgRNAs that target any region in the genome. To avoid zero-division, we add a constant 1 to each samples median.Each sample's read counts are then divided by this target control meian and multiplied by the overall sample median that includes all sgRNAs. The resulting read count distribution is plotted.
 
 ```{r differential_genes}
-p1 <- annotated_sample %>%  ggplot(aes(log(value))) +
+p1 <- annotated_sample %>%
+  filter(cell_id=="A549") %>% 
+  ggplot(aes(log(value))) +
   geom_density(aes(colour = sample_name)) +
   scale_y_continuous(expand = c(0, 0)) +
   theme_classic() +
@@ -182,7 +187,8 @@ targ_med <- annotated_sample %>%
 annotated_sample <- annotated_sample %>% inner_join(targ_med) %>%
   mutate(value = ((value + 1)/med_count)*median(value+1))
 
-p2 <- annotated_sample_n %>% 
+p2 <- annotated_sample %>% 
+  filter(cell_id=="A549") %>%
   ggplot(aes(log(value))) +
     geom_density(aes(colour = sample_name)) +
     scale_y_continuous(expand = c(0, 0)) + 
@@ -281,6 +287,94 @@ ggsave("../plots/A549_volcano_differentials_new.pdf",c,width = 12)
 A549_result %>%
   arrange(fdr) %>% 
   write_delim("../results/A549_results_new_full_crispr_deep.txt",delim = "\t")
+
+```
+
+# Calu3 fold change analysis
+
+As the library control sample for Calu3 did not yield sufficient coverage in terms of genes and sgRNA, we cannot compare it to the treated sample, which all have a higher coverage. Thus we decided that we can utilize the remaining data to check for over representation of each gene's reads againt the non-targeting controls. Thus, raw read counts are first log transformed after adding 1 pseudo count. Then we utilized the normalize.quantiles function of the preprocessCore package to adjust the samples for quantiles distributions.Qauntile normalized, log-transformed count values are then also normalized as relative readcount compared to the non-targeting controls. A fold-over-enrichment over internal controls is the result. This fold change is tested for statistical significance given the sgRNA readcounts collapsed over screening replicates and the sgRNA read counts for each gene after collapsing screening replicates.
+
+```{r}
+log_read_counts <- annotated_sample_raw %>% 
+  filter(cell_id=="Calu3") %>%
+  mutate(value=log(value+1)) %>%
+  select(sgRNA,value,sample_name) %>%
+  spread(sample_name,value) %>% 
+  column_to_rownames("sgRNA") 
+
+normed_read_counts <- log_read_counts %>%
+  as.matrix() %>%
+  normalize.quantiles.robust()
+
+rownames(normed_read_counts) <- rownames(log_read_counts)
+
+colnames(normed_read_counts) <- colnames(log_read_counts)
+
+normed_read_counts %<>% 
+  as_tibble() %>% 
+  mutate(sgRNA=rownames(normed_read_counts)) %>% 
+  gather(sample_name,value,-sgRNA)
+
+gene_map <- annotated_sample %>% 
+  select(sgRNA,Geneid,gene_name) %>% 
+  distinct()
+
+fold_changes <- normed_read_counts %>%
+  left_join(gene_map) %>%
+  spread(sample_name,value) %>%
+  #mutate(across(contains("Rep"),~.x-Calu3_T0_Lib)) %>%
+  select(-Calu3_T0_Lib) %>%
+  gather(sample_name,value,-sgRNA,-Geneid,-gene_name) %>%
+  group_by(sample_name) %>%
+  mutate(value=value-mean(value[Geneid=="NONTARG"]))
+
+
+p <- fold_changes %>%
+  group_by(gene_name,sample_name) %>%
+  summarise(log2fc=mean(value,na.rm=T)) %>%
+  spread(sample_name,log2fc) %>%
+  ungroup() %>%
+  select(-gene_name) %>%
+  GGally::ggpairs() + 
+  theme_classic()
+
+ggsave("../plots/Calu3_Replicate_fc_correlation_new.pdf",p,width = 8,height = 8)
+
+ctrl_fc <- fold_changes %>%
+  filter(Geneid=="NONTARG") %>%
+  group_by(Geneid,gene_name,sgRNA) %>%
+  mutate(value = mean(value,na.rm=T)) %>%
+  pull(value)
+
+statistics <- fold_changes %>%
+  group_by(Geneid,gene_name,sgRNA) %>%
+  mutate(value = mean(value,na.rm=T)) %>%
+  filter(Geneid!="NONTARG") %>%
+  group_by(Geneid,gene_name) %>%
+  do(wilcox.test(.$value,ctrl_fc) %>% broom::tidy()) %>%
+  ungroup()
+
+statistics_annotated <- Calu3_result <- fold_changes %>%
+  group_by(Geneid,gene_name) %>%
+  summarise(log2fc = (mean(value,na.rm = T)-mean(ctrl_fc,na.rm = T))) %>%
+  ungroup() %>%
+  left_join(statistics %>% ungroup %>% select(p.value,Geneid) %>% mutate(fdr=p.adjust(p.value,method="BH")))  %>%
+  mutate(significant = if_else(fdr<0.1,"significant","non-significant"))
+  
+
+c <- statistics_annotated %>%
+    ggplot(aes(x = log2fc, y = -log10(p.value))) + 
+      geom_point(data = subset(statistics_annotated,significant !="significant"),color=b110_grey_light) +
+      geom_point(data = subset(statistics_annotated,significant =="significant"),color=sgi_blue) +
+      geom_point(data = subset(statistics_annotated,significant =="significant"),color=sgi_yellow2) +
+      geom_label_repel(data = statistics_annotated %>% filter(significant =="significant") %>% ungroup() %>% slice_max(log2fc,n=20),aes(label=gene_name),min.segment.length = 0,max.overlaps = 20) +
+    theme_b110()
+
+ggsave("../plots/Calu3_fullvolcano.pdf",c,width = 12)
+
+Calu3_result %>%
+  arrange(fdr) %>% 
+  write_delim("../results/Calu3_results_crispr.txt",delim = "\t")
 
 ```
 
