@@ -1,4 +1,4 @@
-# Stahl et al., Meta-analysis of genome-wide CRISPR screens reveals RAB9A as a SARS-CoV-2 dependency factor involved in viral entry 2024
+# Stahl et al., Meta-analysis of genome-wide CRISPR screens reveals RAB9A as a SARS-CoV-2 dependency factor involved in viral entry, 2024
 
 [![DOI](https://TBA)
 
