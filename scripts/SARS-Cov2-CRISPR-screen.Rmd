@@ -420,7 +420,7 @@ p <- integration_result %>%
     ylab("gene") +
     scale_fill_gradient(low = "white",high = "blue") 
 
-ggsave("../plots/Study_comparison.pdf", p, width = 6,height = 7)
+ggsave("../plots/study_comparison.pdf", p, width = 6,height = 7)
 
 
 ```

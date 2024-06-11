@@ -1,5 +1,4 @@
-common hits with z-scores >0.3 in both screens			
-gene_name	z-score (Schneider et al. [Huh7.5])	z-score (Wei et al. [Vero E6])	average
+Gene	z-score (Schneider et al. [Huh7.5])	z-score (Wei et al. [Vero E6])	Rank
 ACE2	2.767968813	4.573115253	3.670542033
 CTSL	3.550804534	2.917051694	3.233928114
 EP300	5.195652126	1.174487393	3.18506976
