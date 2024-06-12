@@ -406,25 +406,6 @@ Lappalainen T, tenOever BR, Sanjana NE. Identification of Required Host Factors 
 SARS-CoV-2 Infection in Human Cells. Cell. 2021 Jan 7;184(1):92-105.e16.
 doi: 10.1016/j.cell.2020.10.030. Epub 2020 Oct 24. PMID: 33147445; PMCID: PMC7584921.
 
-```{r}
-
-integration_result <- read_delim("../annotations/z_score_table.txt",delim = "\t") %>%
-                        gather(screen,value,-Rank,-Gene)
-
-p <- integration_result %>%
-  ggplot(aes(x=screen,y=reorder(Gene,-Rank,median),fill=value)) +
-    geom_tile() +
-    theme_classic() +
-    theme(axis.text.x=element_text(angle = -45, hjust=0)) +
-    xlab("study") +
-    ylab("gene") +
-    scale_fill_gradient(low = "white",high = "blue") 
-
-ggsave("../plots/study_comparison.pdf", p, width = 6,height = 7)
-
-
-```
-
 # Session info
 
 ```{r}
